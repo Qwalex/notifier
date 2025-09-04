@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  telegram-bot:
+    build: .
+    container_name: telegram-bot
+    ports:
+      - "5656:5656"
+    environment:
+      - NODE_ENV=production
+      - PORT=5656
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - CHAT_ID=${CHAT_ID}
+    volumes:
+      - ./logs:/opt/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5656/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
