@@ -1,0 +1,64 @@
+# Деплой на сервер по SSH: git pull + docker compose up --build
+#
+# Secrets (Settings → Secrets and variables → Actions):
+#   DEPLOY_HOST       — хост (IP или домен)
+#   DEPLOY_USER       — пользователь SSH
+#   DEPLOY_SSH_KEY    — приватный ключ (полный PEM/OpenSSH)
+# Нестандартный SSH-порт: добавьте в шаг appleboy/ssh-action параметр port: 2222
+#
+# Variables (репозиторий → Variables):
+#   DEPLOY_PATH       — каталог с клоном репо и docker-compose.yml (по умолчанию /opt/notifier)
+
+name: CI and deploy
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: npm
+
+      - run: npm ci
+      - run: node --check index.js
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          REMOTE_DIR: ${{ vars.DEPLOY_PATH || '/opt/notifier' }}
+          BRANCH: ${{ github.ref_name }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: REMOTE_DIR,BRANCH
+          script_stop: true
+          script: |
+            set -eu
+            cd "$REMOTE_DIR"
+            git fetch origin "$BRANCH"
+            git checkout "$BRANCH"
+            git pull origin "$BRANCH"
+            docker compose up -d --build

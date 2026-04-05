@@ -11,6 +11,8 @@ services:
       - PORT=5656
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - CHAT_ID=${CHAT_ID}
+      - VK_ACCESS_TOKEN=${VK_ACCESS_TOKEN}
+      - VK_PEER_ID=${VK_PEER_ID}
     volumes:
       - ./logs:/opt/app/logs
     restart: unless-stopped
