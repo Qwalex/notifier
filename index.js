@@ -174,18 +174,13 @@ function buildChannels(telegramResult, vkResult) {
   return channels;
 }
 
-async function handleNotifyPost(req, res) {
-  const text = req.body?.text;
-  if (!text || typeof text !== 'string') {
-    return res.status(400).json({
-      success: false,
-      message: 'Ожидается JSON с полем text (строка)',
-    });
-  }
+function firstQueryParam(val) {
+  if (val == null) return undefined;
+  if (Array.isArray(val)) return val[0] != null ? String(val[0]) : undefined;
+  return String(val);
+}
 
-  const targetChatId = req.body?.chat_id ?? chatId;
-  const vkPeerOverride = req.body?.vk_peer_id;
-
+async function respondNotify(res, text, targetChatId, vkPeerOverride) {
   try {
     const { success, message, channels } = await deliverNotification(
       text,
@@ -205,7 +200,41 @@ async function handleNotifyPost(req, res) {
   }
 }
 
-/** JSON: POST {"text":"..."} (например curl с NOTIFY_URL). */
+/** Простые уведомления: GET ?text=...&chat_id=...&vk_peer_id=... (удобно из браузера; длинный текст — POST). */
+async function handleNotifyGet(req, res) {
+  const text = firstQueryParam(req.query.text);
+  if (!text) {
+    return res.status(400).json({
+      success: false,
+      message: 'Параметр text не указан',
+    });
+  }
+
+  const targetChatId = firstQueryParam(req.query.chat_id) ?? chatId;
+  const vkPeerOverride = firstQueryParam(req.query.vk_peer_id);
+
+  return respondNotify(res, text, targetChatId, vkPeerOverride);
+}
+
+async function handleNotifyPost(req, res) {
+  const text = req.body?.text;
+  if (!text || typeof text !== 'string') {
+    return res.status(400).json({
+      success: false,
+      message: 'Ожидается JSON с полем text (строка)',
+    });
+  }
+
+  const targetChatId = req.body?.chat_id ?? chatId;
+  const vkPeerOverride = req.body?.vk_peer_id;
+
+  return respondNotify(res, text, targetChatId, vkPeerOverride);
+}
+
+/** GET — короткие сообщения; POST — JSON (в т.ч. длинные логи). */
+app.get('/', handleNotifyGet);
+app.get('/notify', handleNotifyGet);
+app.get('/notify/', handleNotifyGet);
 app.post('/', handleNotifyPost);
 app.post('/notify', handleNotifyPost);
 app.post('/notify/', handleNotifyPost);

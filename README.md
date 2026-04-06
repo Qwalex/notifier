@@ -37,12 +37,20 @@ docker-compose down
 
 После запуска бот будет доступен по адресу `http://localhost:5656`
 
-**Отправка сообщения:**
+**Короткое сообщение через GET** (удобно открыть в браузере или вставить ссылку; длинный текст и спецсимволы — лучше через POST):
+
+```
+http://localhost:5656/?text=Ваше%20сообщение
+```
+
+С указанием чата и VK peer: `?text=...&chat_id=123456789&vk_peer_id=...`
+
+**POST с JSON** (деплой и длинные логи):
+
 ```bash
 curl -X POST http://localhost:5656/ -H "Content-Type: application/json" -d '{"text":"Ваше сообщение"}'
 ```
 
-**Отправка в конкретный чат:**
 ```bash
 curl -X POST http://localhost:5656/ -H "Content-Type: application/json" \
   -d '{"text":"Ваше сообщение","chat_id":"123456789"}'
