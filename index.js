@@ -72,7 +72,6 @@ const port = process.env.PORT || 5656;
 app.use(cors({
   origin: '*', // Разрешаем запросы с любых доменов (для разработки)
   // Для продакшена лучше указать конкретный домен:
-  // origin: 'https://gitlab.services.mts.ru'
 }));
 
 app.use(express.json({ limit: '64kb' }));
