@@ -1,4 +1,7 @@
-# Деплой на сервер по SSH: git pull + docker compose up --build
+# Деплой на сервер по SSH (при push / workflow_dispatch в main/master):
+#   cd $DEPLOY_PATH → git pull → docker compose up -d --build
+# Ручной заход по SSH и полная пересборка (--no-cache) нужны только если сломался
+# образ на сервере или не настроены секреты GitHub — не вместо этого workflow.
 #
 # Secrets (Settings → Secrets and variables → Actions):
 #   DEPLOY_HOST       — хост (IP или домен)
@@ -7,7 +10,7 @@
 # Нестандартный SSH-порт: добавьте в шаг appleboy/ssh-action параметр port: 2222
 #
 # Variables (репозиторий → Variables):
-#   DEPLOY_PATH       — каталог с клоном репо и docker-compose.yml (по умолчанию /opt/notifier)
+#   DEPLOY_PATH       — каталог с клоном репо и docker-compose.yml (по умолчанию /root/notifier)
 
 name: CI and deploy
 
@@ -47,7 +50,7 @@ jobs:
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.2.2
         env:
-          REMOTE_DIR: ${{ vars.DEPLOY_PATH || '/opt/notifier' }}
+          REMOTE_DIR: ${{ vars.DEPLOY_PATH || '/root/notifier' }}
           BRANCH: ${{ github.ref_name }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}

@@ -12,7 +12,7 @@
 - `DEPLOY_SSH_KEY` — приватный ключ  
 
 **Variables → Actions (по желанию):**
-- `DEPLOY_PATH` — путь к клону с `docker-compose.yml` (если не задать, используется `/opt/notifier`)
+- `DEPLOY_PATH` — путь к клону с `docker-compose.yml` (если не задать, используется `/root/notifier`)
 
 ### Сервер
 В `DEPLOY_PATH` должен лежать **git-клон этого репо** (тот же remote), настроенный `.env` с токенами, установлены Docker и плагин Compose; у пользователя SSH должны быть права на `git` и `docker` (часто пользователь в группе `docker`).
