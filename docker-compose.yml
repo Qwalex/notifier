@@ -18,7 +18,7 @@ services:
       - ./logs:/opt/app/logs
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:5656/?text=healthcheck"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:5656/health"]
       interval: 30s
       timeout: 10s
       retries: 3

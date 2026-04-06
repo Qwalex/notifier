@@ -75,6 +75,10 @@ app.use(cors({
   // origin: 'https://gitlab.services.mts.ru'
 }));
 
+app.get('/health', (req, res) => {
+  res.status(200).type('text/plain').send('ok');
+});
+
 function buildChannels(telegramResult, vkResult) {
   const channels = [];
 
