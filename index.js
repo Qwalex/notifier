@@ -75,9 +75,43 @@ app.use(cors({
   // origin: 'https://gitlab.services.mts.ru'
 }));
 
+app.use(express.json({ limit: '64kb' }));
+
 app.get('/health', (req, res) => {
   res.status(200).type('text/plain').send('ok');
 });
+
+async function deliverNotification(text, targetChatId, vkPeerOverride) {
+  if (!targetChatId) {
+    throw new Error(
+      'CHAT_ID не указан ни в .env, ни в запросе. Используйте параметр chat_id или добавьте CHAT_ID в .env',
+    );
+  }
+
+  const [telegramResult, vkResult] = await Promise.allSettled([
+    bot.sendMessage(targetChatId, text),
+    sendVkMessage(text, vkPeerOverride || undefined),
+  ]);
+
+  const channels = buildChannels(telegramResult, vkResult);
+  const telegramOk = channels.find((c) => c.service === 'telegram')?.ok;
+  const vkCh = channels.find((c) => c.service === 'vk');
+  const success =
+    telegramOk && (vkCh.skipped || (vkCh.ok && !vkCh.skipped));
+
+  let message;
+  if (!telegramOk) {
+    message = 'Ошибка отправки в Telegram (см. channels)';
+  } else if (vkCh.skipped) {
+    message = 'Сообщение отправлено в Telegram (VK не настроен в .env — пропуск)';
+  } else if (!vkCh.ok) {
+    message = 'Отправлено в Telegram, ошибка VK (см. channels)';
+  } else {
+    message = 'Сообщение отправлено в Telegram и VK';
+  }
+
+  return { success, message, channels };
+}
 
 function buildChannels(telegramResult, vkResult) {
   const channels = [];
@@ -135,35 +169,59 @@ app.get('/', async (req, res) => {
 
   const vkPeerOverride = req.query.vk_peer_id;
 
-  const [telegramResult, vkResult] = await Promise.allSettled([
-    bot.sendMessage(targetChatId, text),
-    sendVkMessage(text, vkPeerOverride || undefined),
-  ]);
+  try {
+    const { success, message, channels } = await deliverNotification(
+      text,
+      targetChatId,
+      vkPeerOverride || undefined,
+    );
 
-  const channels = buildChannels(telegramResult, vkResult);
-  const telegramOk = channels.find((c) => c.service === 'telegram')?.ok;
-  const vkCh = channels.find((c) => c.service === 'vk');
-  const success =
-    telegramOk && (vkCh.skipped || (vkCh.ok && !vkCh.skipped));
+    if (!success) {
+      console.error('Ошибка при отправке:', { channels });
+      return res.status(500).send({ success: false, message, channels });
+    }
 
-  let message;
-  if (!telegramOk) {
-    message = 'Ошибка отправки в Telegram (см. channels)';
-  } else if (vkCh.skipped) {
-    message = 'Сообщение отправлено в Telegram (VK не настроен в .env — пропуск)';
-  } else if (!vkCh.ok) {
-    message = 'Отправлено в Telegram, ошибка VK (см. channels)';
-  } else {
-    message = 'Сообщение отправлено в Telegram и VK';
+    res.send({ success: true, message, channels });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return res.status(400).send({ success: false, message: msg });
   }
-
-  if (!success) {
-    console.error('Ошибка при отправке:', { channels });
-    return res.status(500).send({ success: false, message, channels });
-  }
-
-  res.send({ success: true, message, channels });
 });
+
+async function handleNotifyPost(req, res) {
+  const text = req.body?.text;
+  if (!text || typeof text !== 'string') {
+    return res.status(400).json({
+      success: false,
+      message: 'Ожидается JSON с полем text (строка)',
+    });
+  }
+
+  const targetChatId = req.body?.chat_id ?? chatId;
+  const vkPeerOverride = req.body?.vk_peer_id;
+
+  try {
+    const { success, message, channels } = await deliverNotification(
+      text,
+      targetChatId,
+      vkPeerOverride,
+    );
+
+    if (!success) {
+      console.error('Ошибка при отправке:', { channels });
+      return res.status(500).json({ success: false, message, channels });
+    }
+
+    return res.json({ success: true, message, channels });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return res.status(400).json({ success: false, message: msg });
+  }
+}
+
+/** JSON как в deploy-скриптах: POST {"text":"..."} (например curl с NOTIFY_URL). */
+app.post('/notify', handleNotifyPost);
+app.post('/notify/', handleNotifyPost);
 
 // Запуск сервера
 app.listen(port, () => {

@@ -2,6 +2,8 @@ version: '3.8'
 
 services:
   telegram-bot:
+    # В CI собирается и пушится в GHCR; на VPS: pull + up (см. restart.sh, NOTIFIER_IMAGE).
+    image: ${NOTIFIER_IMAGE:-notifier-telegram-bot-local}
     build: .
     # Не монтируйте каталог проекта в /opt/app — затрёт node_modules из образа
     container_name: telegram-bot

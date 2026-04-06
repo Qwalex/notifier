@@ -1,16 +1,13 @@
-# Деплой на сервер по SSH (при push / workflow_dispatch в main/master):
-#   cd $DEPLOY_PATH → git pull → docker compose up -d --build
-# Ручной заход по SSH и полная пересборка (--no-cache) нужны только если сломался
-# образ на сервере или не настроены секреты GitHub — не вместо этого workflow.
+# Деплой: job build — сборка и push образа в GHCR; job deploy — SSH: git + restart.sh (pull + up).
+# NOTIFY_URL (опционально): только сообщение об успешном деплое — тот же сервис нельзя дергать при падении.
 #
 # Secrets (Settings → Secrets and variables → Actions):
-#   DEPLOY_HOST       — хост (IP или домен)
-#   DEPLOY_USER       — пользователь SSH
-#   DEPLOY_SSH_KEY    — приватный ключ (полный PEM/OpenSSH)
-# Нестандартный SSH-порт: добавьте в шаг appleboy/ssh-action параметр port: 2222
+#   DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY — SSH
+#   GHCR_TOKEN — (опционально) PAT с read:packages для docker pull с GHCR, если образ приватный
 #
-# Variables (репозиторий → Variables):
-#   DEPLOY_PATH       — каталог с клоном репо и docker-compose.yml (по умолчанию /root/notifier)
+# Variables:
+#   DEPLOY_PATH — каталог клона (по умолчанию /root/notifier)
+#   NOTIFY_URL — (опционально) URL вебхука, например https://host/notify/
 
 name: CI and deploy
 
@@ -39,8 +36,43 @@ jobs:
       - run: npm ci
       - run: node --check index.js
 
-  deploy:
+  build:
     needs: verify
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      repo_lower: ${{ steps.repo_lower.outputs.repo_lower }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: repo_lower
+        run: |
+          echo "repo_lower=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo_lower.outputs.repo_lower }}:latest
+            ghcr.io/${{ steps.repo_lower.outputs.repo_lower }}:${{ github.sha }}
+
+  deploy:
+    needs: build
     runs-on: ubuntu-latest
     if: |
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
@@ -52,16 +84,22 @@ jobs:
         env:
           REMOTE_DIR: ${{ vars.DEPLOY_PATH || '/root/notifier' }}
           BRANCH: ${{ github.ref_name }}
+          NOTIFIER_IMAGE: ghcr.io/${{ needs.build.outputs.repo_lower }}:${{ github.sha }}
+          NOTIFY_URL: ${{ vars.NOTIFY_URL }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GHCR_USERNAME: ${{ github.actor }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          envs: REMOTE_DIR,BRANCH
+          envs: REMOTE_DIR,BRANCH,NOTIFIER_IMAGE,NOTIFY_URL,GHCR_TOKEN,GHCR_USERNAME
           script_stop: true
           script: |
             set -eu
             cd "$REMOTE_DIR"
             git fetch origin "$BRANCH"
             git checkout "$BRANCH"
-            git pull origin "$BRANCH"
-            docker compose up -d --build
+            git reset --hard "origin/$BRANCH"
+            export SKIP_GIT=1
+            export DEPLOY_WRAPPER="github-actions deploy.yml"
+            bash ./restart.sh

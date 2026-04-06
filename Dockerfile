@@ -8,8 +8,12 @@ WORKDIR /opt/app
 
 COPY package.json package-lock.json ./
 ENV NODE_ENV=production
+ENV CI=true
 
-# bookworm-slim вместо alpine: npm в Alpine часто даёт «Exit handler never called» и обрывает установку.
+# npm 10.x в Docker часто завершается с «Exit handler never called» (баг cli); npm 9 стабильнее
+RUN npm install -g npm@9.9.4 \
+  && npm --version
+
 RUN npm ci --omit=dev --no-audit --no-fund \
   && test -f node_modules/express/package.json \
   && test -f node_modules/node-telegram-bot-api/package.json
