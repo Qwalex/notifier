@@ -5,17 +5,35 @@ require('dotenv').config();
 
 const VK_API_VERSION = '5.199';
 
+function getVkEnv() {
+  return {
+    accessToken: process.env.VK_ACCESS_TOKEN?.trim(),
+    defaultPeerId: process.env.VK_PEER_ID?.trim(),
+  };
+}
+
 /**
  * Отправка сообщения от имени сообщества VK (messages.send).
- * Нужен токен группы с правом «Сообщения сообщества», пользователь должен разрешить сообщения или написать сообществу.
+ * Нужен ключ доступа сообщества (не пользовательский токен) с правом «Сообщения сообщества».
+ * Получатель должен написать сообществу первым или разрешить ЛС от сообщества.
+ * @see https://dev.vk.com/ru/method/messages.send
  */
 async function sendVkMessage(text, peerIdOverride) {
-  const accessToken = process.env.VK_ACCESS_TOKEN;
-  const defaultPeerId = process.env.VK_PEER_ID;
-  const peerId = peerIdOverride ?? defaultPeerId;
+  const { accessToken, defaultPeerId } = getVkEnv();
+  const peerRaw =
+    peerIdOverride != null && String(peerIdOverride).trim() !== ''
+      ? String(peerIdOverride).trim()
+      : defaultPeerId;
 
-  if (!accessToken || !peerId) {
+  if (!accessToken || !peerRaw) {
     return { skipped: true };
+  }
+
+  const peerId = Number(peerRaw);
+  if (!Number.isFinite(peerId) || !Number.isInteger(peerId)) {
+    throw new Error(
+      `VK: VK_PEER_ID должен быть целым числом (peer_id пользователя или беседы), получено: ${JSON.stringify(peerRaw)}`,
+    );
   }
 
   const body = new URLSearchParams({
@@ -37,7 +55,8 @@ async function sendVkMessage(text, peerIdOverride) {
     const err = data.error;
     throw new Error(`VK API: [${err.error_code}] ${err.error_msg}`);
   }
-  return { skipped: false };
+  const messageId = data.response;
+  return { skipped: false, messageId };
 }
 
 // Инициализация бота с токеном
@@ -56,56 +75,104 @@ app.use(cors({
   // origin: 'https://gitlab.services.mts.ru'
 }));
 
+function buildChannels(telegramResult, vkResult) {
+  const channels = [];
+
+  if (telegramResult.status === 'fulfilled') {
+    channels.push({ service: 'telegram', ok: true });
+  } else {
+    const reason = telegramResult.reason;
+    channels.push({
+      service: 'telegram',
+      ok: false,
+      error: reason instanceof Error ? reason.message : String(reason),
+    });
+  }
+
+  if (vkResult.status === 'fulfilled') {
+    const r = vkResult.value;
+    if (r.skipped) {
+      channels.push({ service: 'vk', ok: true, skipped: true });
+    } else {
+      channels.push({
+        service: 'vk',
+        ok: true,
+        message_id: r.messageId,
+      });
+    }
+  } else {
+    const reason = vkResult.reason;
+    channels.push({
+      service: 'vk',
+      ok: false,
+      error: reason instanceof Error ? reason.message : String(reason),
+    });
+  }
+
+  return channels;
+}
+
 // Обработка GET запроса с параметром text
-// ...existing code...
-// Обработка GET запроса с параметром text
-app.get('/', (req, res) => {
+app.get('/', async (req, res) => {
   const text = req.query.text;
   const targetChatId = req.query.chat_id || chatId;
 
-  console.log({ targetChatId })
-  
   if (!text) {
     return res.status(400).send({ success: false, message: 'Параметр text не указан' });
   }
 
   if (!targetChatId) {
-    return res.status(400).send({ 
-      success: false, 
-      message: 'CHAT_ID не указан ни в .env, ни в запросе. Используйте параметр chat_id или добавьте CHAT_ID в .env' 
+    return res.status(400).send({
+      success: false,
+      message:
+        'CHAT_ID не указан ни в .env, ни в запросе. Используйте параметр chat_id или добавьте CHAT_ID в .env',
     });
   }
 
   const vkPeerOverride = req.query.vk_peer_id;
-  const telegramPromise = bot.sendMessage(targetChatId, text).then(() => ({ service: 'telegram', ok: true }));
-  const vkPromise = sendVkMessage(text, vkPeerOverride || undefined)
-    .then((r) => {
-      if (r.skipped) {
-        return { service: 'vk', ok: true, skipped: true };
-      }
-      return { service: 'vk', ok: true };
-    });
 
-  Promise.all([telegramPromise, vkPromise])
-    .then((outcomes) => {
-      const vkOutcome = outcomes.find((o) => o.service === 'vk');
-      const message =
-        vkOutcome && vkOutcome.skipped
-          ? 'Сообщение отправлено в Telegram (VK не настроен в .env — пропуск)'
-          : 'Сообщение отправлено в Telegram и VK';
-      res.send({ success: true, message, channels: outcomes });
-    })
-    .catch((error) => {
-      console.error('Ошибка при отправке сообщения:', error);
-      res.status(500).send({
-        success: false,
-        message: error.message || 'Ошибка при отправке сообщения',
-      });
-    });
+  const [telegramResult, vkResult] = await Promise.allSettled([
+    bot.sendMessage(targetChatId, text),
+    sendVkMessage(text, vkPeerOverride || undefined),
+  ]);
+
+  const channels = buildChannels(telegramResult, vkResult);
+  const telegramOk = channels.find((c) => c.service === 'telegram')?.ok;
+  const vkCh = channels.find((c) => c.service === 'vk');
+  const success =
+    telegramOk && (vkCh.skipped || (vkCh.ok && !vkCh.skipped));
+
+  let message;
+  if (!telegramOk) {
+    message = 'Ошибка отправки в Telegram (см. channels)';
+  } else if (vkCh.skipped) {
+    message = 'Сообщение отправлено в Telegram (VK не настроен в .env — пропуск)';
+  } else if (!vkCh.ok) {
+    message = 'Отправлено в Telegram, ошибка VK (см. channels)';
+  } else {
+    message = 'Сообщение отправлено в Telegram и VK';
+  }
+
+  if (!success) {
+    console.error('Ошибка при отправке:', { channels });
+    return res.status(500).send({ success: false, message, channels });
+  }
+
+  res.send({ success: true, message, channels });
 });
 
 // Запуск сервера
 app.listen(port, () => {
+  const { accessToken, defaultPeerId } = getVkEnv();
+  if (accessToken && defaultPeerId) {
+    console.log('VK: отправка сообщений включена (peer_id=%s)', defaultPeerId);
+  } else if (accessToken || defaultPeerId) {
+    console.warn(
+      'VK: задайте оба значения VK_ACCESS_TOKEN и VK_PEER_ID — иначе VK отключён',
+    );
+  } else {
+    console.log('VK: не настроено (только Telegram)');
+  }
   console.log(`Сервер запущен на порту ${port}`);
 });
 
