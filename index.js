@@ -5,6 +5,17 @@ require('dotenv').config();
 
 const VK_API_VERSION = '5.199';
 
+/** Telegram Bot API и VK messages.send: одно текстовое сообщение не длиннее этого (UTF-16 code units в JS). */
+const MAX_MESSAGE_CHARS = 4096;
+
+function chunkString(text, maxLen) {
+  const chunks = [];
+  for (let i = 0; i < text.length; i += maxLen) {
+    chunks.push(text.slice(i, i + maxLen));
+  }
+  return chunks;
+}
+
 function getVkEnv() {
   return {
     accessToken: process.env.VK_ACCESS_TOKEN?.trim(),
@@ -18,24 +29,7 @@ function getVkEnv() {
  * Получатель должен написать сообществу первым или разрешить ЛС от сообщества.
  * @see https://dev.vk.com/ru/method/messages.send
  */
-async function sendVkMessage(text, peerIdOverride) {
-  const { accessToken, defaultPeerId } = getVkEnv();
-  const peerRaw =
-    peerIdOverride != null && String(peerIdOverride).trim() !== ''
-      ? String(peerIdOverride).trim()
-      : defaultPeerId;
-
-  if (!accessToken || !peerRaw) {
-    return { skipped: true };
-  }
-
-  const peerId = Number(peerRaw);
-  if (!Number.isFinite(peerId) || !Number.isInteger(peerId)) {
-    throw new Error(
-      `VK: VK_PEER_ID должен быть целым числом (peer_id пользователя или беседы), получено: ${JSON.stringify(peerRaw)}`,
-    );
-  }
-
+async function sendVkMessageOnce(text, peerId, accessToken) {
   const body = new URLSearchParams({
     peer_id: String(peerId),
     message: text,
@@ -55,8 +49,32 @@ async function sendVkMessage(text, peerIdOverride) {
     const err = data.error;
     throw new Error(`VK API: [${err.error_code}] ${err.error_msg}`);
   }
-  const messageId = data.response;
-  return { skipped: false, messageId };
+  return data.response;
+}
+
+async function sendVkMessage(text, peerIdOverride) {
+  const { accessToken, defaultPeerId } = getVkEnv();
+  const peerRaw =
+    peerIdOverride != null && String(peerIdOverride).trim() !== ''
+      ? String(peerIdOverride).trim()
+      : defaultPeerId;
+
+  if (!accessToken || !peerRaw) {
+    return { skipped: true };
+  }
+
+  const peerId = Number(peerRaw);
+  if (!Number.isFinite(peerId) || !Number.isInteger(peerId)) {
+    throw new Error(
+      `VK: VK_PEER_ID должен быть целым числом (peer_id пользователя или беседы), получено: ${JSON.stringify(peerRaw)}`,
+    );
+  }
+
+  let lastMessageId;
+  for (const chunk of chunkString(text, MAX_MESSAGE_CHARS)) {
+    lastMessageId = await sendVkMessageOnce(chunk, peerId, accessToken);
+  }
+  return { skipped: false, messageId: lastMessageId };
 }
 
 // Инициализация бота с токеном
@@ -74,7 +92,8 @@ app.use(cors({
   // Для продакшена лучше указать конкретный домен:
 }));
 
-app.use(express.json({ limit: '64kb' }));
+// Длинные логи/тексты в JSON; разбиение на части по MAX_MESSAGE_CHARS — в deliverNotification.
+app.use(express.json({ limit: '1mb' }));
 
 app.get('/health', (req, res) => {
   res.status(200).type('text/plain').send('ok');
@@ -87,8 +106,14 @@ async function deliverNotification(text, targetChatId, vkPeerOverride) {
     );
   }
 
+  const chunks = chunkString(text, MAX_MESSAGE_CHARS);
+
   const [telegramResult, vkResult] = await Promise.allSettled([
-    bot.sendMessage(targetChatId, text),
+    (async () => {
+      for (const chunk of chunks) {
+        await bot.sendMessage(targetChatId, chunk);
+      }
+    })(),
     sendVkMessage(text, vkPeerOverride || undefined),
   ]);
 
@@ -149,44 +174,6 @@ function buildChannels(telegramResult, vkResult) {
   return channels;
 }
 
-// Обработка GET запроса с параметром text
-app.get('/', async (req, res) => {
-  const text = req.query.text;
-  const targetChatId = req.query.chat_id || chatId;
-
-  if (!text) {
-    return res.status(400).send({ success: false, message: 'Параметр text не указан' });
-  }
-
-  if (!targetChatId) {
-    return res.status(400).send({
-      success: false,
-      message:
-        'CHAT_ID не указан ни в .env, ни в запросе. Используйте параметр chat_id или добавьте CHAT_ID в .env',
-    });
-  }
-
-  const vkPeerOverride = req.query.vk_peer_id;
-
-  try {
-    const { success, message, channels } = await deliverNotification(
-      text,
-      targetChatId,
-      vkPeerOverride || undefined,
-    );
-
-    if (!success) {
-      console.error('Ошибка при отправке:', { channels });
-      return res.status(500).send({ success: false, message, channels });
-    }
-
-    res.send({ success: true, message, channels });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return res.status(400).send({ success: false, message: msg });
-  }
-});
-
 async function handleNotifyPost(req, res) {
   const text = req.body?.text;
   if (!text || typeof text !== 'string') {
@@ -218,7 +205,8 @@ async function handleNotifyPost(req, res) {
   }
 }
 
-/** JSON как в deploy-скриптах: POST {"text":"..."} (например curl с NOTIFY_URL). */
+/** JSON: POST {"text":"..."} (например curl с NOTIFY_URL). */
+app.post('/', handleNotifyPost);
 app.post('/notify', handleNotifyPost);
 app.post('/notify/', handleNotifyPost);
 

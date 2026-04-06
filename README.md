@@ -38,13 +38,14 @@ docker-compose down
 После запуска бот будет доступен по адресу `http://localhost:5656`
 
 **Отправка сообщения:**
-```
-GET http://localhost:5656/?text=Ваше сообщение
+```bash
+curl -X POST http://localhost:5656/ -H "Content-Type: application/json" -d '{"text":"Ваше сообщение"}'
 ```
 
 **Отправка в конкретный чат:**
-```
-GET http://localhost:5656/?text=Ваше сообщение&chat_id=123456789
+```bash
+curl -X POST http://localhost:5656/ -H "Content-Type: application/json" \
+  -d '{"text":"Ваше сообщение","chat_id":"123456789"}'
 ```
 
 ## Переменные окружения
