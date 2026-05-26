@@ -1,12 +1,22 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const cors = require('cors'); // Добавляем импорт cors
+const multer = require('multer');
+const { URL } = require('url');
 require('dotenv').config();
 
 const VK_API_VERSION = '5.199';
 
 /** Telegram Bot API и VK messages.send: одно текстовое сообщение не длиннее этого (UTF-16 code units в JS). */
 const MAX_MESSAGE_CHARS = 4096;
+/** Лимит размера файла (Telegram Bot API — до 50 MB для документов). */
+const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES) || 50 * 1024 * 1024;
+const TELEGRAM_CAPTION_MAX = 1024;
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_FILE_BYTES },
+});
 
 function chunkString(text, maxLen) {
   const chunks = [];
@@ -23,22 +33,17 @@ function getVkEnv() {
   };
 }
 
-/**
- * Отправка сообщения от имени сообщества VK (messages.send).
- * Нужен ключ доступа сообщества (не пользовательский токен) с правом «Сообщения сообщества».
- * Получатель должен написать сообществу первым или разрешить ЛС от сообщества.
- * @see https://dev.vk.com/ru/method/messages.send
- */
-async function sendVkMessageOnce(text, peerId, accessToken) {
-  const body = new URLSearchParams({
-    peer_id: String(peerId),
-    message: text,
-    random_id: String(Math.floor(Math.random() * 2147483647)),
-    access_token: accessToken,
-    v: VK_API_VERSION,
-  });
+async function vkMethod(method, params, accessToken) {
+  const body = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value != null && value !== '') {
+      body.set(key, String(value));
+    }
+  }
+  body.set('access_token', accessToken);
+  body.set('v', VK_API_VERSION);
 
-  const res = await fetch('https://api.vk.com/method/messages.send', {
+  const res = await fetch(`https://api.vk.com/method/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body,
@@ -52,7 +57,7 @@ async function sendVkMessageOnce(text, peerId, accessToken) {
   return data.response;
 }
 
-async function sendVkMessage(text, peerIdOverride) {
+function resolveVkPeer(peerIdOverride) {
   const { accessToken, defaultPeerId } = getVkEnv();
   const peerRaw =
     peerIdOverride != null && String(peerIdOverride).trim() !== ''
@@ -70,11 +75,180 @@ async function sendVkMessage(text, peerIdOverride) {
     );
   }
 
+  return { skipped: false, peerId, accessToken };
+}
+
+/**
+ * Отправка сообщения от имени сообщества VK (messages.send).
+ * @see https://dev.vk.com/ru/method/messages.send
+ */
+async function sendVkMessageOnce(text, peerId, accessToken) {
+  return vkMethod(
+    'messages.send',
+    {
+      peer_id: String(peerId),
+      message: text,
+      random_id: String(Math.floor(Math.random() * 2147483647)),
+    },
+    accessToken,
+  );
+}
+
+async function sendVkMessage(text, peerIdOverride) {
+  const resolved = resolveVkPeer(peerIdOverride);
+  if (resolved.skipped) {
+    return { skipped: true };
+  }
+
+  const { peerId, accessToken } = resolved;
   let lastMessageId;
   for (const chunk of chunkString(text, MAX_MESSAGE_CHARS)) {
     lastMessageId = await sendVkMessageOnce(chunk, peerId, accessToken);
   }
   return { skipped: false, messageId: lastMessageId };
+}
+
+async function uploadToVkServer(uploadUrl, fieldName, file) {
+  const form = new FormData();
+  form.append(
+    fieldName,
+    new Blob([file.buffer], { type: file.mimetype }),
+    file.originalname,
+  );
+  const res = await fetch(uploadUrl, { method: 'POST', body: form });
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    throw new Error(
+      data.error || `VK upload failed: HTTP ${res.status}`,
+    );
+  }
+  return data;
+}
+
+async function sendVkFile(file, peerIdOverride, caption) {
+  const resolved = resolveVkPeer(peerIdOverride);
+  if (resolved.skipped) {
+    return { skipped: true };
+  }
+
+  const { peerId, accessToken } = resolved;
+  let attachment;
+
+  if (file.mimetype?.startsWith('image/')) {
+    const server = await vkMethod(
+      'photos.getMessagesUploadServer',
+      { peer_id: String(peerId) },
+      accessToken,
+    );
+    const uploadData = await uploadToVkServer(server.upload_url, 'photo', file);
+    const saved = await vkMethod(
+      'photos.saveMessagesPhoto',
+      {
+        photo: uploadData.photo,
+        server: String(uploadData.server),
+        hash: uploadData.hash,
+      },
+      accessToken,
+    );
+    const photo = Array.isArray(saved) ? saved[0] : saved;
+    attachment = `photo${photo.owner_id}_${photo.id}`;
+  } else {
+    const server = await vkMethod(
+      'docs.getMessagesUploadServer',
+      { peer_id: String(peerId), type: 'doc' },
+      accessToken,
+    );
+    const uploadData = await uploadToVkServer(server.upload_url, 'file', file);
+    const saved = await vkMethod('docs.save', { file: uploadData.file }, accessToken);
+    const doc = saved.doc ?? saved;
+    attachment = `doc${doc.owner_id}_${doc.id}`;
+  }
+
+  const messageId = await vkMethod(
+    'messages.send',
+    {
+      peer_id: String(peerId),
+      attachment,
+      message: caption || '',
+      random_id: String(Math.floor(Math.random() * 2147483647)),
+    },
+    accessToken,
+  );
+  return { skipped: false, messageId };
+}
+
+async function sendTelegramFile(targetChatId, file, caption) {
+  const opts = {
+    caption: caption || undefined,
+    filename: file.originalname,
+  };
+  const { buffer, mimetype } = file;
+
+  if (mimetype?.startsWith('image/')) {
+    await bot.sendPhoto(targetChatId, buffer, opts);
+  } else if (mimetype?.startsWith('video/')) {
+    await bot.sendVideo(targetChatId, buffer, opts);
+  } else if (mimetype?.startsWith('audio/')) {
+    await bot.sendAudio(targetChatId, buffer, opts);
+  } else {
+    await bot.sendDocument(targetChatId, buffer, opts);
+  }
+}
+
+function filenameFromUrl(fileUrl, contentDisposition) {
+  if (contentDisposition) {
+    const match = /filename\*?=(?:UTF-8''|")?([^";\n]+)/i.exec(contentDisposition);
+    if (match?.[1]) {
+      try {
+        return decodeURIComponent(match[1].replace(/"/g, ''));
+      } catch {
+        return match[1].replace(/"/g, '');
+      }
+    }
+  }
+  try {
+    const base = new URL(fileUrl).pathname.split('/').pop();
+    if (base) return decodeURIComponent(base);
+  } catch {
+    /* ignore */
+  }
+  return 'file';
+}
+
+async function fetchFileFromUrl(fileUrl) {
+  let parsed;
+  try {
+    parsed = new URL(fileUrl);
+  } catch {
+    throw new Error('Некорректный file_url');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('file_url должен использовать http или https');
+  }
+
+  const res = await fetch(fileUrl);
+  if (!res.ok) {
+    throw new Error(`Не удалось скачать file_url: HTTP ${res.status}`);
+  }
+
+  const contentLength = res.headers.get('content-length');
+  if (contentLength && Number(contentLength) > MAX_FILE_BYTES) {
+    throw new Error(`Файл больше лимита (${MAX_FILE_BYTES} байт)`);
+  }
+
+  const buffer = Buffer.from(await res.arrayBuffer());
+  if (buffer.length > MAX_FILE_BYTES) {
+    throw new Error(`Файл больше лимита (${MAX_FILE_BYTES} байт)`);
+  }
+
+  const mimetype =
+    res.headers.get('content-type')?.split(';')[0]?.trim() || 'application/octet-stream';
+
+  return {
+    buffer,
+    originalname: filenameFromUrl(fileUrl, res.headers.get('content-disposition')),
+    mimetype,
+  };
 }
 
 // Инициализация бота с токеном
@@ -132,6 +306,79 @@ async function deliverNotification(text, targetChatId, vkPeerOverride) {
     message = 'Отправлено в Telegram, ошибка VK (см. channels)';
   } else {
     message = 'Сообщение отправлено в Telegram и VK';
+  }
+
+  return { success, message, channels };
+}
+
+function fileSuccessMessage(vkCh) {
+  if (vkCh.skipped) {
+    return 'Файл отправлен в Telegram (VK не настроен в .env — пропуск)';
+  }
+  if (!vkCh.ok) {
+    return 'Файл отправлен в Telegram, ошибка VK (см. channels)';
+  }
+  return 'Файл отправлен в Telegram и VK';
+}
+
+async function deliverWithFile(text, targetChatId, vkPeerOverride, file) {
+  if (!targetChatId) {
+    throw new Error(
+      'CHAT_ID не указан ни в .env, ни в запросе. Используйте параметр chat_id или добавьте CHAT_ID в .env',
+    );
+  }
+
+  const caption =
+    text && text.length <= TELEGRAM_CAPTION_MAX
+      ? text
+      : text
+        ? text.slice(0, TELEGRAM_CAPTION_MAX)
+        : undefined;
+  const telegramRemainder =
+    text && text.length > TELEGRAM_CAPTION_MAX ? text.slice(TELEGRAM_CAPTION_MAX) : undefined;
+  const vkCaption =
+    text && text.length <= MAX_MESSAGE_CHARS
+      ? text
+      : text
+        ? text.slice(0, MAX_MESSAGE_CHARS)
+        : undefined;
+  const vkRemainder =
+    text && text.length > MAX_MESSAGE_CHARS ? text.slice(MAX_MESSAGE_CHARS) : undefined;
+
+  const [telegramResult, vkResult] = await Promise.allSettled([
+    (async () => {
+      await sendTelegramFile(targetChatId, file, caption);
+      if (telegramRemainder) {
+        for (const chunk of chunkString(telegramRemainder, MAX_MESSAGE_CHARS)) {
+          await bot.sendMessage(targetChatId, chunk);
+        }
+      }
+    })(),
+    (async () => {
+      const r = await sendVkFile(file, vkPeerOverride || undefined, vkCaption);
+      if (!r.skipped && vkRemainder) {
+        const resolved = resolveVkPeer(vkPeerOverride);
+        if (!resolved.skipped) {
+          for (const chunk of chunkString(vkRemainder, MAX_MESSAGE_CHARS)) {
+            await sendVkMessageOnce(chunk, resolved.peerId, resolved.accessToken);
+          }
+        }
+      }
+      return r;
+    })(),
+  ]);
+
+  const channels = buildChannels(telegramResult, vkResult);
+  const telegramOk = channels.find((c) => c.service === 'telegram')?.ok;
+  const vkCh = channels.find((c) => c.service === 'vk');
+  const success =
+    telegramOk && (vkCh.skipped || (vkCh.ok && !vkCh.skipped));
+
+  let message;
+  if (!telegramOk) {
+    message = 'Ошибка отправки файла в Telegram (см. channels)';
+  } else {
+    message = fileSuccessMessage(vkCh);
   }
 
   return { success, message, channels };
@@ -200,44 +447,154 @@ async function respondNotify(res, text, targetChatId, vkPeerOverride) {
   }
 }
 
-/** Простые уведомления: GET ?text=...&chat_id=...&vk_peer_id=... (удобно из браузера; длинный текст — POST). */
+async function respondNotifyFile(res, { text, file, targetChatId, vkPeerOverride }) {
+  try {
+    const { success, message, channels } = await deliverWithFile(
+      text || '',
+      targetChatId,
+      vkPeerOverride,
+      file,
+    );
+
+    if (!success) {
+      console.error('Ошибка при отправке файла:', { channels });
+      return res.status(500).json({ success: false, message, channels });
+    }
+
+    return res.json({ success: true, message, channels });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return res.status(400).json({ success: false, message: msg });
+  }
+}
+
+async function respondNotifyWithOptionalFile(
+  res,
+  { text, fileUrl, file, targetChatId, vkPeerOverride },
+) {
+  try {
+    const fileToSend = file || (fileUrl ? await fetchFileFromUrl(fileUrl) : null);
+    if (fileToSend) {
+      return respondNotifyFile(res, {
+        text: text || '',
+        file: fileToSend,
+        targetChatId,
+        vkPeerOverride,
+      });
+    }
+    if (!text) {
+      return res.status(400).json({
+        success: false,
+        message: 'Укажите text, file (multipart) или file_url',
+      });
+    }
+    return respondNotify(res, text, targetChatId, vkPeerOverride);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return res.status(400).json({ success: false, message: msg });
+  }
+}
+
+/** Простые уведомления: GET ?text=... или ?file_url=... */
 async function handleNotifyGet(req, res) {
   const text = firstQueryParam(req.query.text);
-  if (!text) {
+  const fileUrl = firstQueryParam(req.query.file_url);
+
+  if (!text && !fileUrl) {
     return res.status(400).json({
       success: false,
-      message: 'Параметр text не указан',
+      message: 'Укажите text и/или file_url',
     });
   }
 
   const targetChatId = firstQueryParam(req.query.chat_id) ?? chatId;
   const vkPeerOverride = firstQueryParam(req.query.vk_peer_id);
 
-  return respondNotify(res, text, targetChatId, vkPeerOverride);
+  return respondNotifyWithOptionalFile(res, {
+    text,
+    fileUrl,
+    targetChatId,
+    vkPeerOverride,
+  });
 }
 
-async function handleNotifyPost(req, res) {
-  const text = req.body?.text;
-  if (!text || typeof text !== 'string') {
+async function handleNotifyMultipart(req, res) {
+  if (!req.file) {
     return res.status(400).json({
       success: false,
-      message: 'Ожидается JSON с полем text (строка)',
+      message: 'Для multipart нужно поле file',
     });
   }
 
+  const text = req.body?.text ?? req.body?.caption;
   const targetChatId = req.body?.chat_id ?? chatId;
   const vkPeerOverride = req.body?.vk_peer_id;
+  const file = {
+    buffer: req.file.buffer,
+    originalname: req.file.originalname || 'file',
+    mimetype: req.file.mimetype || 'application/octet-stream',
+  };
+
+  return respondNotifyFile(res, {
+    text: text || '',
+    file,
+    targetChatId,
+    vkPeerOverride,
+  });
+}
+
+function maybeUpload(req, res, next) {
+  const ct = req.headers['content-type'] || '';
+  if (!ct.includes('multipart/form-data')) {
+    return next();
+  }
+  upload.single('file')(req, res, (err) => {
+    if (err) {
+      const msg =
+        err.code === 'LIMIT_FILE_SIZE'
+          ? `Файл больше лимита (${MAX_FILE_BYTES} байт)`
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+      return res.status(status).json({ success: false, message: msg });
+    }
+    return handleNotifyMultipart(req, res);
+  });
+}
+
+async function handleNotifyPost(req, res) {
+  const fileUrl = req.body?.file_url;
+  const text = req.body?.text;
+  const targetChatId = req.body?.chat_id ?? chatId;
+  const vkPeerOverride = req.body?.vk_peer_id;
+
+  if (typeof fileUrl === 'string' && fileUrl.trim()) {
+    return respondNotifyWithOptionalFile(res, {
+      text: typeof text === 'string' ? text : '',
+      fileUrl: fileUrl.trim(),
+      targetChatId,
+      vkPeerOverride,
+    });
+  }
+
+  if (!text || typeof text !== 'string') {
+    return res.status(400).json({
+      success: false,
+      message: 'Ожидается JSON с полем text (строка) или file_url',
+    });
+  }
 
   return respondNotify(res, text, targetChatId, vkPeerOverride);
 }
 
-/** GET — короткие сообщения; POST — JSON (в т.ч. длинные логи). */
+/** GET — текст/file_url; POST — JSON или multipart (поле file). */
 app.get('/', handleNotifyGet);
 app.get('/notify', handleNotifyGet);
 app.get('/notify/', handleNotifyGet);
-app.post('/', handleNotifyPost);
-app.post('/notify', handleNotifyPost);
-app.post('/notify/', handleNotifyPost);
+app.post('/', maybeUpload, handleNotifyPost);
+app.post('/notify', maybeUpload, handleNotifyPost);
+app.post('/notify/', maybeUpload, handleNotifyPost);
 
 // Запуск сервера
 app.listen(port, () => {

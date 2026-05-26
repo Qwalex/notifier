@@ -56,12 +56,26 @@ curl -X POST http://localhost:5656/ -H "Content-Type: application/json" \
   -d '{"text":"Ваше сообщение","chat_id":"123456789"}'
 ```
 
+**Файл (multipart, поле `file`, опционально `text` как подпись):**
+
+```bash
+curl -X POST http://localhost:5656/notify -F "file=@./report.pdf" -F "text=Отчёт за день"
+```
+
+**Файл по ссылке (JSON или GET `file_url`):**
+
+```bash
+curl -X POST http://localhost:5656/notify -H "Content-Type: application/json" \
+  -d '{"file_url":"https://example.com/file.pdf","text":"Подпись"}'
+```
+
 ## Переменные окружения
 
 - `TELEGRAM_BOT_TOKEN` - токен вашего Telegram бота
 - `CHAT_ID` - ID чата по умолчанию для отправки сообщений
 - `PORT` - порт для запуска сервера (по умолчанию 5656)
 - `NODE_ENV` - окружение (production/development)
+- `MAX_FILE_BYTES` - максимальный размер загружаемого файла в байтах (по умолчанию 50 MB)
 
 ## Логи
 
