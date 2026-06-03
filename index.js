@@ -588,6 +588,168 @@ async function handleNotifyPost(req, res) {
   return respondNotify(res, text, targetChatId, vkPeerOverride);
 }
 
+/** Railway project webhooks — https://docs.railway.com/observability/webhooks */
+function railwaySeverityEmoji(severity) {
+  switch (String(severity || '').toUpperCase()) {
+    case 'CRITICAL':
+    case 'ERROR':
+      return '🔴';
+    case 'WARNING':
+      return '🟡';
+    case 'INFO':
+      return '🔵';
+    default:
+      return '🚂';
+  }
+}
+
+function railwayEventTitle(type) {
+  if (!type || typeof type !== 'string') {
+    return 'Событие Railway';
+  }
+  const [category, ...rest] = type.split('.');
+  const action = rest.join('.') || '';
+  const categoryRu = {
+    Deployment: 'Деплой',
+    Volume: 'Том',
+    Monitor: 'Мониторинг',
+    Alert: 'Алерт',
+  }[category] || category;
+  const actionRu = {
+    failed: 'ошибка',
+    success: 'успех',
+    crashed: 'краш',
+    removed: 'удалён',
+    started: 'запущен',
+    completed: 'завершён',
+  }[action.toLowerCase()] || action.replace(/_/g, ' ');
+  return action ? `${categoryRu}: ${actionRu}` : categoryRu;
+}
+
+function appendRailwayLine(lines, label, value) {
+  if (value == null || value === '') return;
+  lines.push(`${label}: ${value}`);
+}
+
+function formatRailwayWebhookMessage(payload) {
+  const { type, details = {}, resource = {}, severity, timestamp } = payload;
+  const emoji = railwaySeverityEmoji(severity);
+  const lines = [`${emoji} Railway — ${railwayEventTitle(type)}`];
+
+  if (type) {
+    appendRailwayLine(lines, 'Тип', type);
+  }
+  if (severity) {
+    appendRailwayLine(lines, 'Важность', severity);
+  }
+
+  const project = resource.project?.name;
+  const service = resource.service?.name;
+  const environment = resource.environment?.name;
+  const workspace = resource.workspace?.name;
+  appendRailwayLine(lines, 'Workspace', workspace);
+  appendRailwayLine(lines, 'Проект', project);
+  appendRailwayLine(lines, 'Сервис', service);
+  appendRailwayLine(lines, 'Окружение', environment);
+  if (resource.environment?.isEphemeral) {
+    appendRailwayLine(lines, 'Эфемерное окружение', 'да');
+  }
+
+  const deploymentId =
+    resource.deployment?.id || details.id;
+  appendRailwayLine(lines, 'Deployment ID', deploymentId);
+
+  if (details.status) {
+    appendRailwayLine(lines, 'Статус', details.status);
+  }
+  if (details.source) {
+    appendRailwayLine(lines, 'Источник', details.source);
+  }
+  if (details.branch) {
+    appendRailwayLine(lines, 'Ветка', details.branch);
+  }
+  if (details.commitHash) {
+    const short =
+      String(details.commitHash).length > 8
+        ? String(details.commitHash).slice(0, 7)
+        : details.commitHash;
+    appendRailwayLine(lines, 'Коммит', short);
+  }
+  if (details.commitAuthor) {
+    appendRailwayLine(lines, 'Автор', details.commitAuthor);
+  }
+  if (details.commitMessage) {
+    const msg = String(details.commitMessage).trim();
+    const clipped = msg.length > 500 ? `${msg.slice(0, 497)}...` : msg;
+    appendRailwayLine(lines, 'Сообщение коммита', clipped);
+  }
+
+  const extraDetailKeys = Object.keys(details).filter(
+    (k) =>
+      ![
+        'id',
+        'status',
+        'source',
+        'branch',
+        'commitHash',
+        'commitAuthor',
+        'commitMessage',
+      ].includes(k),
+  );
+  for (const key of extraDetailKeys) {
+    const val = details[key];
+    if (val != null && typeof val !== 'object') {
+      appendRailwayLine(lines, key, String(val));
+    }
+  }
+
+  if (timestamp) {
+    appendRailwayLine(lines, 'Время', timestamp);
+  }
+
+  return lines.join('\n');
+}
+
+function verifyRailwayWebhookSecret(req) {
+  const secret = process.env.RAILWAY_WEBHOOK_SECRET?.trim();
+  if (!secret) {
+    return null;
+  }
+  const provided =
+    firstQueryParam(req.query.secret) ||
+    req.headers['x-webhook-secret'] ||
+    req.headers['x-railway-webhook-secret'];
+  if (provided !== secret) {
+    return 'Неверный секрет webhook (задайте ?secret=... или заголовок X-Webhook-Secret)';
+  }
+  return null;
+}
+
+async function handleRailwayWebhook(req, res) {
+  const authError = verifyRailwayWebhookSecret(req);
+  if (authError) {
+    return res.status(401).json({ success: false, message: authError });
+  }
+
+  const body = req.body;
+  if (!body || typeof body !== 'object' || !body.type) {
+    return res.status(400).json({
+      success: false,
+      message: 'Ожидается JSON payload Railway с полем type',
+    });
+  }
+
+  const text = formatRailwayWebhookMessage(body);
+  const targetChatId = firstQueryParam(req.query.chat_id) ?? chatId;
+  const vkPeerOverride = firstQueryParam(req.query.vk_peer_id);
+
+  console.log('Railway webhook: %s', body.type);
+  return respondNotify(res, text, targetChatId, vkPeerOverride);
+}
+
+app.post('/webhooks/railway', handleRailwayWebhook);
+app.post('/webhooks/railway/', handleRailwayWebhook);
+
 /** GET — текст/file_url; POST — JSON или multipart (поле file). */
 app.get('/', handleNotifyGet);
 app.get('/notify', handleNotifyGet);

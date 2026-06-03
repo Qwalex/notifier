@@ -69,6 +69,22 @@ curl -X POST http://localhost:5656/notify -H "Content-Type: application/json" \
   -d '{"file_url":"https://example.com/file.pdf","text":"Подпись"}'
 ```
 
+### Railway (деплои и алерты)
+
+В Railway: **Project → Settings → Webhooks** укажите URL:
+
+```
+https://ваш-хост/webhooks/railway
+```
+
+С секретом (если задан `RAILWAY_WEBHOOK_SECRET` в `.env`):
+
+```
+https://ваш-хост/webhooks/railway?secret=ваш_секрет
+```
+
+События (статусы деплоев, алерты CPU/RAM/томов) приходят JSON с полем `type`; сервис форматирует текст и шлёт в Telegram и VK. Документация: [Railway Webhooks](https://docs.railway.com/observability/webhooks).
+
 ## Переменные окружения
 
 - `TELEGRAM_BOT_TOKEN` - токен вашего Telegram бота
@@ -76,6 +92,7 @@ curl -X POST http://localhost:5656/notify -H "Content-Type: application/json" \
 - `PORT` - порт для запуска сервера (по умолчанию 5656)
 - `NODE_ENV` - окружение (production/development)
 - `MAX_FILE_BYTES` - максимальный размер загружаемого файла в байтах (по умолчанию 50 MB)
+- `RAILWAY_WEBHOOK_SECRET` - опциональный секрет для `POST /webhooks/railway` (query `secret` или заголовок `X-Webhook-Secret`)
 
 ## Логи
 
